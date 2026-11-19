@@ -19,13 +19,17 @@ Użycie:
   ipko accounts
   ipko history   KONTO [--from RRRR-MM-DD] [--to RRRR-MM-DD] [--json]
   ipko statement KONTO --from RRRR-MM-DD --to RRRR-MM-DD [--format pdf|csv|xls|xml|html] [-o PLIK] [--force]
+  ipko recipients [--json]
   ipko transfer  --from KONTO --to NRB --name ODBIORCA --amount KWOTA --title TYTUŁ
                  [--address ADRES] [--date RRRR-MM-DD] [--express | --sorbnet] [--yes]
+  ipko transfer  --recipient ODBIORCA --amount KWOTA [--title TYTUŁ] [--from KONTO]
+                 [--date RRRR-MM-DD] [--express | --sorbnet] [--yes]
   ipko own       --from KONTO --to KONTO --amount KWOTA [--title TYTUŁ] [--date RRRR-MM-DD] [--yes]
   ipko tax       --from KONTO --symbol SYMBOL --account NRB --amount KWOTA --period OKRES
                  [--tax-office] [--obligation ID] [--date RRRR-MM-DD] [--express] [--yes]
 
 KONTO   końcówka numeru (min. 4 cyfry), pełny numer albo fragment nazwy rachunku
+ODBIORCA  z książki odbiorców: Twoja nazwa, nazwa odbiorcy albo końcówka jego numeru
 KWOTA   np. 250 albo 1234,56
 OKRES   RRRR-MM (miesiąc), RRRR-Qn (kwartał), RRRR-Hn (półrocze), RRRR (rok),
         RRRR-MM-Dn (dekada), RRRR-MM-DD (dzień)
@@ -40,6 +44,9 @@ IPKO_DEBUG=1 wypisuje przebieg zapytań (bez danych) na stderr.
 
 func main() { os.Exit(run(os.Args[1:])) }
 
+// probeHook: tylko w buildzie z tagiem "probe" (narzędzia deweloperskie, poza zwykłą binarką).
+var probeHook func(c *Client, accts []Account) error
+
 func run(args []string) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
 		fmt.Print(usage)
@@ -49,12 +56,16 @@ func run(args []string) int {
 		return 0
 	}
 	cmds := map[string]func([]string) error{
-		"accounts":  cmdAccounts,
-		"history":   cmdHistory,
-		"statement": cmdStatement,
-		"transfer":  cmdTransfer,
-		"own":       cmdOwn,
-		"tax":       cmdTax,
+		"accounts":   cmdAccounts,
+		"history":    cmdHistory,
+		"statement":  cmdStatement,
+		"transfer":   cmdTransfer,
+		"recipients": cmdRecipients,
+		"own":        cmdOwn,
+		"tax":        cmdTax,
+	}
+	if probeHook != nil {
+		cmds["probe-recipients"] = func([]string) error { return withSession(probeHook) }
 	}
 	f, ok := cmds[args[0]]
 	if !ok {
@@ -409,6 +420,7 @@ func cmdTransfer(args []string) error {
 	fs := flag.NewFlagSet("transfer", flag.ContinueOnError)
 	from := fs.String("from", "", "")
 	to := fs.String("to", "", "")
+	recipient := fs.String("recipient", "", "")
 	name := fs.String("name", "", "")
 	address := fs.String("address", "", "")
 	amount := fs.String("amount", "", "")
@@ -424,8 +436,14 @@ func cmdTransfer(args []string) error {
 	if len(pos) > 0 {
 		return usagef("transfer: nieoczekiwany argument %q", pos[0])
 	}
+	if *recipient != "" {
+		if *to != "" || *name != "" || *address != "" {
+			return usagef("--recipient wyklucza --to, --name i --address (dane odbiorcy są w książce)")
+		}
+		return transferToRecipient(*recipient, *from, *amount, *title, *date, *express, *sorbnet, *yes)
+	}
 	if *from == "" {
-		return usagef("podaj --from")
+		return usagef("podaj --from (albo --recipient)")
 	}
 	nrb, err := normalizeNRB(*to)
 	if err != nil {
@@ -567,6 +585,82 @@ func cmdTax(args []string) error {
 			return err
 		}
 		fmt.Fprintln(os.Stderr, "Przelew podatkowy przyjęty przez bank.")
+		return nil
+	})
+}
+
+func transferToRecipient(recipient, from, amount, title, date string, express, sorbnet, yes bool) error {
+	amt, err := normalizeAmount(amount)
+	if err != nil {
+		return usagef("--amount: %v", err)
+	}
+	if err := checkText("--title", title, 140, false); err != nil {
+		return err
+	}
+	pt := ""
+	if express || sorbnet {
+		if pt, err = paymentType(express, sorbnet); err != nil {
+			return err
+		}
+	}
+	if date == "" {
+		date = today()
+	} else if err := checkDate(date, "--date"); err != nil {
+		return usageError{err.Error()}
+	}
+	return withSession(func(c *Client, accts []Account) error {
+		list, err := c.Recipients()
+		if err != nil {
+			return err
+		}
+		r, err := resolveRecipient(list, recipient)
+		if err != nil {
+			return err
+		}
+		var src *Account
+		if from != "" {
+			if src, err = resolveAccount(accts, from); err != nil {
+				return err
+			}
+		}
+		if err := c.TransferToRecipient(RecipientTransfer{Recipient: r, From: src, Amount: amt, Title: title, Date: date, PaymentType: pt}, accts, confirmer(yes)); err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stderr, "Przelew przyjęty przez bank.")
+		return nil
+	})
+}
+
+func cmdRecipients(args []string) error {
+	fs := flag.NewFlagSet("recipients", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, "")
+	pos, err := parseArgs(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 0 {
+		return usagef("recipients: nieoczekiwany argument %q", pos[0])
+	}
+	return withSession(func(c *Client, accts []Account) error {
+		list, err := c.Recipients()
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			type out struct {
+				OwnName, Name, Account, Address, Title string
+			}
+			var o []out
+			for _, r := range list {
+				o = append(o, out{r.OwnName, r.Name, r.Account, r.Address, r.Title})
+			}
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return enc.Encode(o)
+		}
+		for _, r := range list {
+			fmt.Printf("%s\t%s\t%s\t%s\n", oneLine(r.OwnName), oneLine(r.Name), formatNRB(oneLine(r.Account)), oneLine(r.Title))
+		}
 		return nil
 	})
 }

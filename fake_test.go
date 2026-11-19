@@ -22,21 +22,24 @@ type fakeCall struct {
 }
 
 type fakeIPKO struct {
-	t          *testing.T
-	mu         sync.Mutex
-	calls      []fakeCall
-	seq        int
-	polls      int
-	authReady  map[string]bool
-	rejectIKO  bool
-	wrongPass  bool
-	loginIKO   bool // bank żąda IKO w trakcie logowania (nowe urządzenie)
-	lpGone     bool
-	noIKO      bool   // bank w ogóle nie żąda IKO (np. zaufane urządzenie)
-	redirectTo string // przekierowanie POST z hasłem
-	dropFinal  bool   // zerwanie połączenia po ostatnim kroku przelewu
-	wrongFlow  bool   // odpowiedź z innym flow_id // po zatwierdzeniu lp zwraca OBJECT_NOT_FOUND zamiast READY
-	loggedOut  bool
+	t                    *testing.T
+	mu                   sync.Mutex
+	calls                []fakeCall
+	seq                  int
+	polls                int
+	authReady            map[string]bool
+	rejectIKO            bool
+	wrongPass            bool
+	loginIKO             bool // bank żąda IKO w trakcie logowania (nowe urządzenie)
+	lpGone               bool
+	noIKO                bool   // bank w ogóle nie żąda IKO (np. zaufane urządzenie)
+	redirectTo           string // przekierowanie POST z hasłem
+	dropFinal            bool   // zerwanie połączenia po ostatnim kroku przelewu
+	wrongFlow            bool   // odpowiedź z innym flow_id
+	swapRecipientAccount bool   // formularz recipient-pay z innym rachunkiem niż lista
+	lastRecipientSubmit  map[string]any
+	trustedRecipient     bool // bank nie żąda IKO dla dyspozycji (zaufany odbiorca) // po zatwierdzeniu lp zwraca OBJECT_NOT_FOUND zamiast READY
+	loggedOut            bool
 }
 
 func newFake(t *testing.T) (*fakeIPKO, *httptest.Server) {
@@ -188,6 +191,11 @@ func (f *fakeIPKO) serve(w http.ResponseWriter, r *http.Request) {
 	case p == "/ipko3/transactions/transfers/normal/shortcut":
 		switch env.StateID {
 		case "":
+			// jak prawdziwy bank: bez numeru rachunku źródłowego -> 400
+			if env.Data["account"] != "80102000000000111122223333" && env.Data["account"] != "27102000000000444455556666" {
+				f.reply(w, map[string]any{"httpStatus": 400, "state_id": "ERROR", "response": map[string]any{}})
+				return
+			}
 			f.reply(w, flowReply("fill_form", "N", map[string]any{"fields": map[string]any{}}, false))
 		case "fill_form":
 			want := map[string]any{"recipient_account": "47116000000000000012345678", "recipient_name": "Urzad Miasta", "hold_create": false,
@@ -214,6 +222,48 @@ func (f *fakeIPKO) serve(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			f.reply(w, flowReply("END", "N", map[string]any{"data": map[string]any{}}, true))
+		}
+	case p == "/ipko3/transactions/recipients/normal":
+		f.reply(w, map[string]any{"httpStatus": 200, "response": map[string]any{"case_id": "ITEMS", "data": map[string]any{"next": nil, "items": []any{
+			map[string]any{"recipient_id": "R1", "recipient_name": "JAN TESTOWY", "recipient_own_name": "WYKONAWCA", "recipient_address": "",
+				"title": "FAKTURA 12/2026", "recipient_account": map[string]any{"number": "47116000000000000012345678", "format": "NRB"},
+				"source_account": map[string]any{"id": "ID-OSOB"}},
+			map[string]any{"recipient_id": "R2", "recipient_name": "MBANK SA", "recipient_own_name": "mBank", "recipient_address": "ul. Testowa 1",
+				"title": "", "recipient_account": map[string]any{"number": "07102000000000999955556666", "format": "NRB"},
+				"source_account": map[string]any{"id": "ID-FIRMA"}},
+		}}}})
+	case p == "/ipko3/transactions/transfers/normal/recipient-pay":
+		recipients := map[string][]string{"R1": {"47116000000000000012345678", "JAN TESTOWY", "", "FAKTURA 12/2026", "ID-OSOB"},
+			"R2": {"07102000000000999955556666", "MBANK SA", "ul. Testowa 1", "", "ID-FIRMA"}}
+		switch env.StateID {
+		case "":
+			rc, ok := recipients[fmt.Sprint(env.Data["id"])]
+			if !ok {
+				f.reply(w, map[string]any{"httpStatus": 400, "state_id": "ERROR", "response": map[string]any{}})
+				return
+			}
+			acct := rc[0]
+			if f.swapRecipientAccount {
+				acct = "80102000000000111122223333"
+			}
+			val := func(v string) map[string]any { return map[string]any{"value": v, "widget": map[string]any{}} }
+			f.reply(w, flowReply("fill_form", "RP", map[string]any{"data": map[string]any{"recipient_bank": "PKOBP Oddział testowy"},
+				"fields": map[string]any{
+					"recipient_account": val(acct), "recipient_name": val(rc[1]), "recipient_address": val(rc[2]), "title": val(rc[3]),
+					"source_account": map[string]any{"value": rc[4], "widget": map[string]any{"items": []any{map[string]any{"id": "ID-OSOB"}, map[string]any{"id": "ID-FIRMA"}}}},
+					"payment_type":   map[string]any{"value": "INTERNAL", "widget": map[string]any{"items": []any{map[string]any{"id": "INTERNAL"}, map[string]any{"id": "EXPRESS-ELIXIR"}}}},
+				}}, false))
+		case "fill_form":
+			f.lastRecipientSubmit = env.Data
+			if f.trustedRecipient {
+				f.reply(w, flowReply("tan_state", "RP", map[string]any{"data": map[string]any{}}, false))
+				return
+			}
+			f.reply(w, flowReply("tan_state", "RP", map[string]any{"auth": authObj("500"), "data": map[string]any{}}, false))
+		case "tan_state":
+			if needAuth("500") {
+				f.reply(w, flowReply("END", "RP", map[string]any{"data": map[string]any{}}, true))
+			}
 		}
 	case p == "/ipko3/transactions/transfers/own":
 		switch env.StateID {
@@ -544,5 +594,100 @@ func TestTaxSummaryShowsPayerBeforeConsent(t *testing.T) {
 	}
 	if last := f.calls[len(f.calls)-1]; last.Action != "cancel" {
 		t.Errorf("po odmowie formularz powinien zostać anulowany, ostatnia akcja: %q", last.Action)
+	}
+}
+
+func TestRecipientsAndResolve(t *testing.T) {
+	f, srv := newFake(t)
+	c := newTestClient(srv)
+	loginTest(t, f, c)
+	list, err := c.Recipients()
+	if err != nil || len(list) != 2 {
+		t.Fatalf("Recipients: %v %+v", err, list)
+	}
+	for q, want := range map[string]string{"wykonawca": "R1", "mbank": "R2", "MBANK SA": "R2", "5678": "R1", "jan": "R1"} {
+		if r, err := resolveRecipient(list, q); err != nil || r.ID != want {
+			t.Errorf("resolveRecipient(%q) = %v, %v; want %s", q, r, err, want)
+		}
+	}
+	for _, q := range []string{"nikt", "12", "a"} {
+		if r, err := resolveRecipient(list, q); err == nil {
+			t.Errorf("resolveRecipient(%q) = %s: oczekiwany błąd", q, r.ID)
+		}
+	}
+}
+
+func TestTransferToRecipientDefaults(t *testing.T) {
+	f, srv := newFake(t)
+	c := newTestClient(srv)
+	accts := loginTest(t, f, c)
+	list, _ := c.Recipients()
+	var summary string
+	err := c.TransferToRecipient(RecipientTransfer{Recipient: &list[0], Amount: "100.00", Date: "2026-11-19"}, accts,
+		func(s string) error { summary = s; return nil })
+	if err != nil {
+		t.Fatalf("TransferToRecipient: %v", err)
+	}
+	// domyślnie: rachunek przypisany do odbiorcy, tytuł z książki, rodzaj przelewu wg banku
+	assertJSON(t, "recipient submit", f.lastRecipientSubmit, map[string]any{"recipient_account": "47116000000000000012345678",
+		"recipient_name": "JAN TESTOWY", "hold_create": false, "money": map[string]any{"amount": "100.00", "currency": "PLN"},
+		"payment_date": "2026-11-19", "payment_type": "INTERNAL", "source_account": "ID-OSOB", "title": "FAKTURA 12/2026"})
+	for _, want := range []string{"JAN TESTOWY", "WYKONAWCA", "PKOBP Oddział testowy", "FAKTURA 12/2026", "100.00 PLN", "INTERNAL"} {
+		if !strings.Contains(summary, want) {
+			t.Errorf("podsumowanie bez %q:\n%s", want, summary)
+		}
+	}
+}
+
+func TestTransferToRecipientOverridesAndNoTitle(t *testing.T) {
+	f, srv := newFake(t)
+	c := newTestClient(srv)
+	accts := loginTest(t, f, c)
+	list, _ := c.Recipients()
+	// R2 nie ma domyślnego tytułu: bez --title odmowa przed jakimkolwiek submit
+	if err := c.TransferToRecipient(RecipientTransfer{Recipient: &list[1], Amount: "5.00", Date: "2026-11-19"}, accts, yesConfirm); err == nil || f.lastRecipientSubmit != nil {
+		t.Fatalf("bez tytułu: err=%v submit=%v", err, f.lastRecipientSubmit)
+	}
+	err := c.TransferToRecipient(RecipientTransfer{Recipient: &list[1], From: &accts[0], Amount: "5.00", Title: "Spłata karty",
+		Date: "2026-11-19", PaymentType: "EXPRESS-ELIXIR"}, accts, yesConfirm)
+	if err != nil {
+		t.Fatalf("TransferToRecipient: %v", err)
+	}
+	d := f.lastRecipientSubmit
+	if d["source_account"] != "ID-OSOB" || d["title"] != "Spłata karty" || d["payment_type"] != "EXPRESS-ELIXIR" || d["recipient_address"] != "ul. Testowa 1" {
+		t.Errorf("submit: %v", d)
+	}
+	if err := c.TransferToRecipient(RecipientTransfer{Recipient: &list[1], Amount: "5.00", Title: "x", Date: "2026-11-19", PaymentType: "SORBNET"}, accts, yesConfirm); err == nil {
+		t.Error("rodzaj przelewu spoza listy banku powinien dać błąd")
+	}
+}
+
+func TestTransferToRecipientFormMismatchAborts(t *testing.T) {
+	f, srv := newFake(t)
+	c := newTestClient(srv)
+	accts := loginTest(t, f, c)
+	list, _ := c.Recipients()
+	f.swapRecipientAccount = true
+	err := c.TransferToRecipient(RecipientTransfer{Recipient: &list[0], Amount: "1.00", Date: "2026-11-19"}, accts, yesConfirm)
+	if err == nil || f.lastRecipientSubmit != nil {
+		t.Fatalf("niezgodny rachunek w formularzu banku: err=%v, submit=%v", err, f.lastRecipientSubmit)
+	}
+	if last := f.calls[len(f.calls)-1]; last.Action != "cancel" {
+		t.Errorf("formularz powinien zostać anulowany, ostatnia akcja: %q", last.Action)
+	}
+}
+
+func TestTrustedRecipientWithoutIKOIsCancelled(t *testing.T) {
+	f, srv := newFake(t)
+	c := newTestClient(srv)
+	accts := loginTest(t, f, c)
+	list, _ := c.Recipients()
+	f.trustedRecipient = true
+	err := c.TransferToRecipient(RecipientTransfer{Recipient: &list[0], Amount: "1.00", Date: "2026-11-19"}, accts, yesConfirm)
+	if !errors.Is(err, errNoIKO) || !strings.Contains(err.Error(), "nic nie wysłano") {
+		t.Fatalf("oczekiwana odmowa bez IKO, jest: %v", err)
+	}
+	if last := f.calls[len(f.calls)-1]; last.Action != "cancel" {
+		t.Errorf("dyspozycja bez IKO musi zostać anulowana, ostatnia akcja: %q", last.Action)
 	}
 }

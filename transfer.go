@@ -84,7 +84,8 @@ func (c *Client) TransferNormal(t NormalTransfer, confirm Confirmer) error {
 	if err := confirm(summary); err != nil {
 		return err
 	}
-	f, rep, err := c.StartFlow("/ipko3/transactions/transfers/normal/shortcut", nil)
+	// Przeglądarka otwiera formularz z numerem rachunku źródłowego; bez niego bank zwraca 400.
+	f, rep, err := c.StartFlow("/ipko3/transactions/transfers/normal/shortcut", map[string]any{"account": t.From.Number})
 	if err != nil {
 		return fmt.Errorf("przelew: %w", err)
 	}

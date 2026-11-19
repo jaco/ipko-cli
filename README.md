@@ -111,6 +111,23 @@ Przelew przyjęty przez bank.
 Opcje: `--date RRRR-MM-DD` (przelew z datą przyszłą), `--express` (Express Elixir),
 `--sorbnet`, `--address`.
 
+### Przelew do odbiorcy z książki
+
+```console
+$ ipko recipients
+WYKONAWCA   JAN TESTOWY   47 1160 0000 0000 0000 1234 5678   FAKTURA 12/2026
+mBank     MBANK SA      07 1020 0000 0000 9999 5555 6666
+
+$ ipko transfer --recipient wykonawca --amount 1500
+$ ipko transfer --recipient mbank --amount 300 --title 'Spłata karty' --from firmowy
+```
+
+Odbiorcę wskazujesz **swoją nazwą z książki**, nazwą odbiorcy albo końcówką jego numeru.
+Numer konta, nazwę i adres podstawia bank (z książki — nie da się ich zmienić z CLI),
+tytuł i rachunek źródłowy są domyślne dla odbiorcy, chyba że podasz `--title` / `--from`.
+`ipko` sprawdza, że formularz banku dotyczy dokładnie wybranego odbiorcy, i pokazuje pełne
+podsumowanie (z bankiem odbiorcy) przed zgodą.
+
 ### Przelew własny
 
 ```sh
@@ -211,6 +228,8 @@ Dane w testach są fikcyjne.
 
 - Tylko macOS (pęk kluczy) i tylko autoryzacja przez IKO (bez SMS i kart kodów).
 - Przelewy krajowe w PLN; bez przelewów zagranicznych, zleceń stałych i doładowań.
+- Książka odbiorców: tylko odbiorcy przelewów zwykłych (bez podatkowych); dodawanie
+  i edycja odbiorców tylko w iPKO.
 - Strona WWW wysyła dodatkowo dane antyfraudowe (analiza zachowania); `ipko` ich nie wysyła.
   Bank traktuje go jak nowe urządzenie i dlatego żąda potwierdzenia w IKO przy każdym logowaniu.
 

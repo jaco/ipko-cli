@@ -367,6 +367,15 @@ func parseAuth(rep *Reply) (*AuthInfo, error) {
 	return r.Auth, nil
 }
 
+func hasAuthField(rep *Reply) bool {
+	var r map[string]json.RawMessage
+	if rep == nil || json.Unmarshal(rep.Response, &r) != nil {
+		return false
+	}
+	_, ok := r["auth"]
+	return ok
+}
+
 func hasAuth(rep *Reply) bool {
 	_, err := parseAuth(rep)
 	return err == nil
@@ -388,6 +397,7 @@ func responseKeys(rep *Reply) string {
 
 var (
 	errAuthTimeout = errors.New("minął czas na zatwierdzenie w IKO")
+	errNoIKO       = errors.New("przerwano")
 	// errAuthGone: obiekt autoryzacji zniknął z kolejki powiadomień (np. już obsłużony).
 	// Wynik i tak rozstrzyga bank w kolejnym kroku operacji, więc wtedy go wysyłamy.
 	errAuthGone = errors.New("autoryzacja IKO: OBJECT_NOT_FOUND")
@@ -486,6 +496,10 @@ func (c *Client) finishAuthorized(f *Flow, rep *Reply, what string) (*Reply, err
 	auth, err := parseAuth(rep)
 	if err != nil {
 		f.Cancel()
+		if !hasAuthField(rep) {
+			// np. zaufany odbiorca: bank zwolnił dyspozycję z IKO. ipko z zasady nie zleca nic bez IKO.
+			return nil, fmt.Errorf("%w: bank nie wymaga zatwierdzenia w IKO dla tej dyspozycji (np. zaufany odbiorca); ipko wysyła przelewy wyłącznie z IKO, więc anulowano ją, nic nie wysłano", errNoIKO)
+		}
 		return nil, err
 	}
 	if err := c.WaitMobileAuth(auth, what); err != nil {
