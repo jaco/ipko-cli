@@ -1,0 +1,9 @@
+# Nagrania sesji bankowych zawierają dane kont i operacji: nigdy do repo.
+recording/
+/ipko
+*.pdf
+*.csv
+*.xls
+*.xml
+*.html
+tools/
